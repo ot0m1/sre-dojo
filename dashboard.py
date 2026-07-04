@@ -29,8 +29,48 @@ SCENARIOS = {
     "dbflood": ("DB遅延攻撃", "重いDBクエリを連打。CPU/メモリは余るのに応答だけ遅くなる"),
 }
 
+# 各攻撃の攻略導線（易しいモードで攻撃中に表示）。
+# 観察 → 確認(どのコンテナのどのボタンか=クリックで開く) → 犯人サイン → 対処、の4ステップ。
+# check の各項目 = (role, action, ボタン名, 見るべきもの)
+PLAYBOOK = {
+    "ramp": {
+        "watch": "app の CPU バーと メモリ バー。人数が増えるにつれ、どちらが先に上限へ張り付くか。",
+        "check": [("app", "procs", "プロセス上位", "apache2/php がCPUを食っているか"),
+                  ("app", "workers", "ワーカー数", "apache2 が増え続けてメモリを圧迫していないか")],
+        "sign": "CPU が 50%(＝0.5コアの上限) に張り付く／メモリが 256MiB 上限に迫り、応答が急に遅くなる。1台の処理能力を超えた状態。",
+        "fix": "1台の限界。<b>スケールアウト</b>で耐える → 第2章で app を複数台にし、前に <b>ロードバランサー</b> を置いて分散する（第1章では上限までが答え）。",
+        "wrong": "ここでDBを疑っても直らない。db のCPU/接続はまだ余裕のはず（自分で確認して切り分けろ）。",
+    },
+    "spike": {
+        "watch": "開始3秒でいきなり400人。app の CPU バーが一瞬で天井に張り付く様子。",
+        "check": [("app", "workers", "ワーカー数", "処理中の作業員が一気に増える"),
+                  ("app", "logs", "ログ", "503 や応答遅延の兆候")],
+        "sign": "反応する間もなくCPU/ワーカーが飽和。じわ増しと違い、増やす猶予がない＝事前に備えるしかないと分かる。",
+        "fix": "急増は事後では間に合わない。<b>Auto Scaling（自動増設）</b>や、平常から余裕を持った台数＝<b>プロビジョニング</b>で備える（第2〜3章の主題）。",
+        "wrong": "「後から手で増やす」では急襲に勝てない。それを体感するのがこの攻撃の狙い。",
+    },
+    "cpubomb": {
+        "watch": "たった20人なのに app の CPU バーだけが天井。メモリは低いまま。",
+        "check": [("app", "procs", "プロセス上位", "php がCPU%上位に居座る"),
+                  ("app", "stats", "リソース", "CPUだけ高く、プロセス数(PIDs)は少ない")],
+        "sign": "人数が少ないのにCPUが張り付く＝1リクエストの処理が重い（計算過多）。台数でなく処理自体が犯人。",
+        "fix": "重い処理そのものを軽くする → <b>結果をキャッシュ</b>（同じ計算を毎回しない）、非同期化、アルゴリズム改善。むやみに台数を増やすのは金の無駄。",
+        "wrong": "台数を増やせば「捌ける数」は増えるが、1発が重い問題は残る。まず処理を軽くするのが筋。",
+    },
+    "dbflood": {
+        "watch": "app の CPU/メモリは余裕なのに、応答だけ遅い。犯人は app じゃない。",
+        "check": [("db", "conns", "接続数/上限", "Threads_connected が max_connections(50) に迫る/超える"),
+                  ("db", "proclist", "実行中クエリ", "SELECT SLEEP … が大量に並ぶ＝重いクエリが接続を長く握る"),
+                  ("db", "logs", "ログ", "Too many connections が出ていないか")],
+        "sign": "リソースは余ってるのに遅い＝『待ち』。DB接続が上限まで埋まり、新規は接続できず弾かれる。",
+        "fix": "① 遅いクエリを速く（インデックス/クエリ改善）。② <b>コネクションプール</b>で接続を使い回す。③ 読み取りを<b>リードレプリカ</b>に逃がす。④ 応急で max_connections↑（根本治療ではない）。",
+        "wrong": "app を増やしてもDBが詰まってるので無意味。むしろ接続が増えてDBがさらに苦しむ。ボトルネックの層を見極めろ。",
+    },
+}
+
 _lock = threading.Lock()
 _cache = {"t": 0.0, "data": None}
+_attack_lock = threading.Lock()  # 攻撃の起動/停止を直列化（裏スレッド同士の競合防止）
 
 
 def run(args, timeout=15):
@@ -51,6 +91,39 @@ def docker_logs(name, lines):
         return (p.stdout or "") + (p.stderr or "")
     except Exception as e:
         return f"(ログ取得エラー: {e})"
+
+
+def run_out(args, timeout=15):
+    """任意のdockerコマンドのstdout+stderrをまとめて返す（診断用）。"""
+    try:
+        p = subprocess.run(["docker"] + args, capture_output=True, text=True,
+                           timeout=timeout, encoding="utf-8", errors="replace")
+        return ((p.stdout or "") + (p.stderr or "")).strip() or "(出力なし)"
+    except Exception as e:
+        return f"(実行エラー: {e})"
+
+
+# 診断アクション: key -> dockerに渡す引数を作る関数。実コマンドを撃って結果を見せる。
+DIAG = {
+    "logs":     lambda n: ["logs", "--tail", "60", n],
+    "stats":    lambda n: ["stats", "--no-stream", "--format",
+                           "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.PIDs}}", n],
+    # app(Apache/PHP)向け
+    "procs":    lambda n: ["exec", n, "sh", "-c",
+                           "ps -eo pid,pcpu,pmem,rss,comm --sort=-pcpu 2>/dev/null | head -15 "
+                           "|| echo 'ps不可(procps未導入?)'"],
+    "workers":  lambda n: ["exec", n, "sh", "-c",
+                           "printf 'Apacheワーカー数(処理中の作業員): '; "
+                           "ps -C apache2 --no-headers 2>/dev/null | wc -l"],
+    # db(MySQL)向け
+    "conns":    lambda n: ["exec", n, "sh", "-c",
+                           "mysql -uroot -proot -t -e \"SHOW STATUS LIKE 'Threads_connected'; "
+                           "SHOW STATUS LIKE 'Threads_running'; "
+                           "SHOW GLOBAL STATUS LIKE 'Max_used_connections'; "
+                           "SHOW VARIABLES LIKE 'max_connections'\" 2>&1 | grep -vi insecure"],
+    "proclist": lambda n: ["exec", n, "sh", "-c",
+                           "mysql -uroot -proot -e 'SHOW PROCESSLIST' 2>&1 | grep -vi insecure"],
+}
 
 
 def read_attack_plan():
@@ -130,7 +203,8 @@ def gather():
                     sc = e.split("=", 1)[1] or "ramp"
             nm, det = SCENARIOS.get(sc, SCENARIOS["ramp"])
             attack = {"active": status == "running", "name": nm,
-                      "detail": det, "scenario": sc, "container": name}
+                      "detail": det, "scenario": sc, "container": name,
+                      "playbook": PLAYBOOK.get(sc)}
             continue
 
         # dojo 以外のプロジェクトのコンテナは無視（このPCの他の物を映さない）
@@ -157,6 +231,7 @@ def gather():
             "memPerc": round(mem_perc, 0),
             "memCap": (f"{memlimit // (1024*1024)}MiB" if memlimit else "上限なし"),
             "logCmd": f"docker logs --tail 50 -f {name}",
+            "role": role,
         }
         tiers[role].append(card)
 
@@ -259,6 +334,25 @@ HTML = r"""<!DOCTYPE html>
   .loghead button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:6px 13px;cursor:pointer;font-family:inherit}
   #logbody{margin:0;padding:12px 16px;overflow:auto;flex:1;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.5;color:var(--txt2);white-space:pre-wrap;word-break:break-all}
   .lerr{color:#ff8a80;font-weight:600}
+  .card.easyw{width:320px}
+  .chint{margin-top:9px;background:#0b0f14;border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:11px;color:var(--txt2);line-height:1.6}
+  .chint b{color:var(--txt)}
+  .diagbtns{display:flex;gap:6px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line)}
+  .diagbtns button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:6px 11px;font-size:12px;cursor:pointer;font-family:inherit}
+  .diagbtns button.on{background:var(--accent);color:#001;border-color:var(--accent)}
+  .diagcmd{padding:7px 16px;font-family:ui-monospace,Consolas,monospace;font-size:11px;color:#9ecbff;border-bottom:1px solid var(--line);word-break:break-all;background:#0b0f14}
+  .diagguide{padding:11px 16px;border-top:1px solid var(--line);font-size:12px;color:var(--txt2);line-height:1.8;background:var(--panel2)}
+  .diagguide b{color:var(--txt)}
+  .pb{background:var(--panel);border:1px solid #5c4a12;border-left:3px solid var(--warn);border-radius:var(--radius);padding:13px 16px;margin:0 0 16px;font-size:13px}
+  .pb h4{margin:0 0 10px;font-size:14px;color:var(--warn)}
+  .pb .step{margin:9px 0;padding-left:27px;position:relative;color:var(--txt2);line-height:1.7}
+  .pb .step .num{position:absolute;left:0;top:1px;width:19px;height:19px;border-radius:50%;background:var(--warn);color:#1a1400;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}
+  .pb .step b{color:var(--txt)}
+  .pb .cbtn{display:inline-block;margin:3px 6px 3px 0;background:#0b0f14;color:#9ecbff;border:1px solid var(--line);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;font-family:inherit}
+  .pb .cbtn:hover{border-color:var(--accent)}
+  .pb .look{color:var(--txt3);font-size:12px}
+  .pb .fix{background:#0f2a16;border:1px solid #1e5c30;border-radius:6px;padding:9px 12px;margin-top:6px;color:#c9f0d4;line-height:1.7}
+  .pb .wrong{color:var(--txt3);font-size:12px;margin-top:8px}
 </style></head>
 <body class="easy">
 <div class="wrap">
@@ -281,24 +375,34 @@ HTML = r"""<!DOCTYPE html>
   <div class="alegend easyonly" id="alegend"></div>
 
   <div id="attack" class="attack"></div>
+  <div id="playbook"></div>
   <div id="body"></div>
 
   <div class="help easyonly">
-    <h3>メトリクスとログの読み方（答えは出さない・推測はお前がやる）</h3>
+    <h3>SRE診断の型（易しいモードのみ・答えは出さない、推測はお前がやる）</h3>
+    <p><b>観察 → 仮説 → 確認 → 対処</b>。まず攻撃を撃って「どのバーが先に上限へ張り付くか」を観察。犯人を仮説したら、そのカードの <b>🔍診断する</b> ボタンで確認コマンドを撃つ。合ってたら構成を直す。</p>
+    <h3 style="margin-top:15px">どの箱でも使う3つの基本コマンド</h3>
     <ul>
-      <li><b>CPUバーが上限（100%）に張り付く</b> → その箱は計算で手一杯。1秒あたりの処理量が頭打ち＝<i>CPUがボトルネックの疑い</i>。</li>
-      <li><b>メモリバーが上限に近い</b> → 同時に立てられる作業員（プロセス/ワーカー）の数が頭打ちの疑い。あふれると強制終了(OOM)も。</li>
-      <li><b>応答が遅いのにCPUもメモリも余ってる</b> → どこかで「順番待ちの行列」か「接続数の上限」に引っかかってる疑い。</li>
-      <li><b>ログの見方</b>：各カードの黒いコマンドをクリックでコピー → 自分のターミナルに貼って実行。<code>-f</code> は追従表示（Ctrl+Cで止める）。</li>
-      <li>DBの悲鳴を探すなら db のログで <code>Too many connections</code> / <code>aborted</code>、Webの悲鳴なら app のログで <code>503</code> / <code>MaxRequestWorkers</code> あたりを目で探す。</li>
+      <li><code>docker stats &lt;名前&gt;</code> … 生のCPU/メモリ（このダッシュボードが常時見せてる物）。</li>
+      <li><code>docker logs --tail 60 &lt;名前&gt;</code> … エラーの悲鳴（<code>503</code> / <code>Too many connections</code> / <code>Fatal</code>）。</li>
+      <li><code>docker exec -it &lt;名前&gt; sh</code> … <b>箱の中に入る</b>。中で <code>top</code> / <code>ps aux</code> で誰がCPU/メモリを食ってるか見る。診断パネルのボタンはこれを代わりに撃ってる。</li>
     </ul>
-    <p style="margin:8px 0 0">ログを読んで「これが原因かな？」と思ったら、その推測をチャットの俺にぶつけろ。合ってたら、どこをどう構成変更すれば攻撃に耐えるかを返す。</p>
+    <h3 style="margin-top:15px">症状 → 撃つべき確認</h3>
+    <ul>
+      <li><b>CPUが上限で応答が遅い</b> → 診断パネルの「プロセス上位」。<code>apache2</code>/<code>php</code> がCPUを食ってれば計算過多かリクエスト過多。</li>
+      <li><b>メモリが上限近い・行列待ち</b> → 「ワーカー数」。<code>apache2</code> プロセスが多数＝同時処理がRAMで頭打ち＝新規は順番待ち。</li>
+      <li><b>CPUもメモリも余ってるのに遅い</b> → db の「接続数/上限」と「実行中クエリ」。接続あふれか、<code>Sleep</code>/遅いクエリで待たされてる。</li>
+    </ul>
+    <p style="margin:8px 0 0">読んで「これが原因かな？」と思ったら、その推測をチャットの俺にぶつけろ。合ってたら、どこをどう直せば耐えるかを返す。</p>
   </div>
 </div>
 <div id="logmodal" class="logmodal hidden">
   <div class="logbox">
     <div class="loghead"><span id="logtitle"></span><button onclick="closeLog()">✕ 閉じる</button></div>
+    <div class="diagbtns" id="diagbtns"></div>
+    <div class="diagcmd" id="diagcmd"></div>
     <pre id="logbody"></pre>
+    <div class="diagguide easyonly" id="diagguide"></div>
   </div>
 </div>
 <div class="toast" id="toast">コピーした</div>
@@ -319,41 +423,89 @@ const ATTACKS={
 };
 function toast(m){const to=document.getElementById('toast');to.textContent=m;to.classList.add('show');setTimeout(()=>to.classList.remove('show'),1200);}
 function copyCmd(el){const t=el.textContent;if(navigator.clipboard)navigator.clipboard.writeText(t);toast('コピーした');}
-function fire(t){toast('攻撃開始: '+ATTACKS[t][0]);fetch('/api/attack?type='+t,{method:'POST'}).then(()=>setTimeout(tick,400));}
-function stopAttack(){toast('攻撃を停止');fetch('/api/stop',{method:'POST'}).then(()=>setTimeout(tick,400));}
+function pollBurst(){[250,800,1600,2600,3600].forEach(function(ms){setTimeout(tick,ms);});}
+function fire(t){toast('攻撃を起動中… '+ATTACKS[t][0]);fetch('/api/attack?type='+t,{method:'POST'});pollBurst();}
+function stopAttack(){toast('攻撃を停止中…');fetch('/api/stop',{method:'POST'});pollBurst();}
 document.getElementById('alegend').innerHTML='<b>各攻撃の狙い（易しいモード）:</b><br>'+Object.keys(ATTACKS).map(k=>'・<b>'+ATTACKS[k][0]+'</b> … '+ATTACKS[k][1]).join('<br>');
 
-let curLog=null, logTimer=null;
-function openLog(name){curLog=name;document.getElementById('logtitle').textContent='ログ: '+name+'（赤い行がエラー＝悲鳴。2秒ごとに自動更新）';
-  document.getElementById('logmodal').classList.remove('hidden');refreshLog();
-  clearInterval(logTimer);logTimer=setInterval(refreshLog,2000);}
-function closeLog(){document.getElementById('logmodal').classList.add('hidden');curLog=null;clearInterval(logTimer);}
+const DIAG_ACTIONS={
+  app:[['logs','ログ'],['procs','プロセス上位(CPU)'],['workers','ワーカー数'],['stats','リソース']],
+  db: [['logs','ログ'],['conns','接続数/上限'],['proclist','実行中クエリ'],['stats','リソース']],
+  lb: [['logs','ログ'],['stats','リソース']],
+};
+const DIAG_GUIDE={
+  app:'<b>appの診かた（Apache/PHP）:</b><br>・CPUバーが上限(100%) → 「プロセス上位」で <b>apache2</b>/<b>php</b> がCPUを食ってるか確認（計算過多 or リクエスト過多）。<br>・メモリが上限近い → 「ワーカー数」を見る。<b>apache2</b> が多数＝同時処理がRAMで頭打ち＝新規は行列待ち。<br>・ログに <b>503</b> / <b>Connection refused</b> → 犯人はappでなくDB。dbを診ろ。',
+  db:'<b>dbの診かた（MySQL）:</b><br>・「接続数/上限」で <b>Threads_connected</b> が <b>max_connections</b> に迫る → 接続あふれ（ログに <b>Too many connections</b>）。対処＝上限↑/コネクションプール/リードレプリカ。<br>・「実行中クエリ」に <b>Sleep</b> や重い行が並ぶ → 遅いクエリが接続を長く握ってる。<br>・CPUもメモリも低いのに遅い → 待ち（ロック/遅延）。リソースでなく設計を疑え。',
+  lb:'<b>lbの診かた:</b><br>・「ログ」で振り分け先やエラー、「リソース」でLB自身の負荷を確認。',
+};
+let curName=null, curRole='app', curAction='logs', diagTimer=null;
+function openLog(name, role){curName=name;curRole=(DIAG_ACTIONS[role]?role:'app');curAction='logs';
+  document.getElementById('logtitle').textContent='🔍 診断: '+name+'（2.5秒ごとに自動更新／赤い行=悲鳴）';
+  document.getElementById('diagbtns').innerHTML=DIAG_ACTIONS[curRole].map(function(a){return '<button data-a="'+a[0]+'" onclick="setAction(\''+a[0]+'\')">'+a[1]+'</button>';}).join('');
+  document.getElementById('diagguide').innerHTML=DIAG_GUIDE[curRole]||'';
+  document.getElementById('logmodal').classList.remove('hidden');
+  setAction('logs');
+  clearInterval(diagTimer);diagTimer=setInterval(runDiag,2500);}
+function setAction(a){curAction=a;
+  Array.prototype.forEach.call(document.querySelectorAll('#diagbtns button'),function(b){b.classList.toggle('on',b.getAttribute('data-a')===a);});
+  runDiag();}
+function closeLog(){document.getElementById('logmodal').classList.add('hidden');curName=null;clearInterval(diagTimer);}
 function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function fmtLog(t){return t.split('\n').map(function(l){var e=escHtml(l);
-  return /error|too many connections|fatal|503|cannot|denied|aborted|refused|warn/i.test(l)?'<span class="lerr">'+e+'</span>':e;}).join('\n');}
-async function refreshLog(){if(!curLog)return;
-  try{const r=await fetch('/api/logs?name='+encodeURIComponent(curLog)+'&lines=100');const j=await r.json();
+  return /error|too many connections|fatal|503|cannot|denied|aborted|refused|warn|Sleep/i.test(l)?'<span class="lerr">'+e+'</span>':e;}).join('\n');}
+async function runDiag(){if(!curName)return;
+  try{const r=await fetch('/api/diag?name='+encodeURIComponent(curName)+'&action='+curAction);const j=await r.json();
+    document.getElementById('diagcmd').textContent='$ '+(j.cmd||'');
     const b=document.getElementById('logbody');const atBottom=b.scrollTop+b.clientHeight>=b.scrollHeight-30;
-    b.innerHTML=fmtLog(j.log||'(空)');if(atBottom)b.scrollTop=b.scrollHeight;}catch(e){}}
+    b.innerHTML=fmtLog(j.out||'(空)');if(curAction==='logs'&&atBottom)b.scrollTop=b.scrollHeight;}catch(e){}}
+
+let ROLE2NAME={};
+function openDiagFor(role, action){
+  const name=ROLE2NAME[role];
+  if(!name){toast('対象コンテナが見つからない');return;}
+  openLog(name, role);
+  setAction(action);
+}
+function renderPlaybook(s){
+  const pb=document.getElementById('playbook');
+  if(!(s.attack.active && s.attack.playbook && MODE==='easy')){pb.innerHTML='';return;}
+  const p=s.attack.playbook;
+  const checks=p.check.map(function(c){
+    return '<button class="cbtn" onclick="openDiagFor(\''+c[0]+'\',\''+c[1]+'\')">'+c[0]+' → 「'+c[2]+'」を開く</button> <span class="look">'+c[3]+'</span>';
+  }).join('<br>');
+  pb.innerHTML='<div class="pb"><h4>🎯 この攻撃の攻略手順（'+s.attack.name+'）</h4>'
+    +'<div class="step"><span class="num">1</span><b>観察</b>：'+p.watch+'</div>'
+    +'<div class="step"><span class="num">2</span><b>確認</b>（ボタンを押すとその診断が直接開く）：<br>'+checks+'</div>'
+    +'<div class="step"><span class="num">3</span><b>犯人サイン</b>：'+p.sign+'</div>'
+    +'<div class="step"><span class="num">4</span><b>対処（どう直せば耐えるか）</b>：<div class="fix">'+p.fix+'</div><div class="wrong">⚠ やりがちな誤り：'+p.wrong+'</div></div>'
+    +'</div>';
+}
 
 function fillClass(p){return p>=90?'danger':p>=70?'warn':'';}
 
+const HINTS={
+  app:'🩺 <b>見る観点</b>: 同時処理の上限。攻撃中にCPUバーが上限へ張り付く（計算過多）か、メモリでワーカー数が頭打ち（行列待ち）か。診断パネルの「プロセス上位」「ワーカー数」で確認。',
+  db:'🩺 <b>見る観点</b>: 接続と遅いクエリ。攻撃中に接続数が上限へ迫る（あふれ）か、実行中クエリに <b>Sleep</b> が並ぶ（待ち）か。診断パネルの「接続数/上限」「実行中クエリ」で確認。',
+  lb:'🩺 <b>見る観点</b>: 振り分け先とLB自身の負荷。',
+};
 function card(c){
   const dot = c.status==='running'?'ok':'bad';
   const cpuFill = fillClass(c.cpuOfCap), memFill = fillClass(c.memPerc);
+  const wide = MODE==='easy' ? ' easyw' : '';
+  const chint = MODE==='easy' ? '<div class="chint">'+(HINTS[c.role]||'')+'</div>' : '';
   let logs = '';
   if(MODE==='easy'){
     logs = '<div class="logcmd">ターミナル派はこれでも見れる（クリックでコピー）:'
          + '<code onclick="copyCmd(this)">'+c.logCmd+'</code></div>';
   }
-  const viewbtn = '<button class="logbtn" onclick="openLog(\''+c.name+'\')">📄 このコンテナのログを見る</button>';
-  return '<div class="card"><div class="n"><span class="dot '+dot+'"></span>'+c.svc+'</div>'
+  const viewbtn = '<button class="logbtn" onclick="openLog(\''+c.name+'\',\''+c.role+'\')">🔍 このコンテナを診断する</button>';
+  return '<div class="card'+wide+'"><div class="n"><span class="dot '+dot+'"></span>'+c.svc+'</div>'
     + '<div class="sub">'+c.name+'<br>'+c.image+'</div>'
     + '<div class="metric"><span>CPU</span><span>'+c.cpuLabel+'</span></div>'
     + '<div class="bar"><div class="fill '+cpuFill+'" style="width:'+Math.min(c.cpuOfCap,100)+'%"></div></div>'
     + '<div class="metric"><span>メモリ</span><span>'+c.mem+'（上限 '+c.memCap+'）</span></div>'
     + '<div class="bar"><div class="fill '+memFill+'" style="width:'+Math.min(c.memPerc,100)+'%"></div></div>'
-    + viewbtn + logs + '</div>';
+    + chint + viewbtn + logs + '</div>';
 }
 
 function tierRow(cards){return '<div class="row">'+cards.map(card).join('')+'</div>';}
@@ -361,17 +513,22 @@ function tierRow(cards){return '<div class="row">'+cards.map(card).join('')+'</d
 function render(s){
   document.getElementById('clock').textContent = '更新 '+s.time+' ／ 章: '+s.chapter+' ／ プロジェクト: '+(s.project||'-');
 
+  ROLE2NAME={};
+  if(s.tiers){['lb','app','db'].forEach(function(r){if(s.tiers[r]&&s.tiers[r][0])ROLE2NAME[r]=s.tiers[r][0].name;});}
+
   const a = document.getElementById('attack');
   if(s.attack.active){
     a.className='attack on';
     a.innerHTML='<div class="h">⚠ 攻撃 進行中: '+s.attack.name+'</div>'
-      +'<div>'+s.attack.detail+'</div>'
+      +'<div>'+s.attack.detail+' <b style="color:#ff8a80">／ ■停止を押すまで継続</b></div>'
       +(MODE==='easy'?'<div class="hint" style="margin-top:5px">この攻撃が来ている間に、下の各コンテナのCPU/メモリがどう動くかを見ろ。先に上限へ張り付いた箱が犯人候補。</div>':'');
   } else {
     a.className='attack';
     a.innerHTML='<div class="h">攻撃なし（待機中）</div>'
-      +(MODE==='easy'?'<div class="hint" style="margin-top:4px">別ウィンドウで <code style="background:#0b0f14;padding:1px 5px;border-radius:4px">./dojo.ps1 attack</code> を撃つと、ここに攻撃内容が出て、下のバーが動き出す。</div>':'');
+      +(MODE==='easy'?'<div class="hint" style="margin-top:4px">上の攻撃ボタンを押すと、ここに攻撃内容と<b>攻略手順</b>が出て、下のバーが動き出す。</div>':'');
   }
+
+  renderPlaybook(s);
 
   const body = document.getElementById('body');
   if(!s.up){
@@ -409,19 +566,21 @@ tick(); setInterval(tick, 2000);
 def start_attack(scenario):
     if scenario not in SCENARIOS:
         scenario = "ramp"
-    run(["rm", "-f", "dojo-attack"])
-    loaddir = os.path.join(ROOT, CHAPTER, "load").replace("\\", "/")
-    run(["run", "--rm", "-d", "--name", "dojo-attack",
-         "--add-host=host.docker.internal:host-gateway",
-         "-e", "SCENARIO=" + scenario,
-         "-v", loaddir + ":/load",
-         "grafana/k6", "run", "/load/attack.js"], timeout=40)
+    with _attack_lock:  # 停止や別の攻撃と重ならないよう直列化
+        run(["rm", "-f", "dojo-attack"])
+        loaddir = os.path.join(ROOT, CHAPTER, "load").replace("\\", "/")
+        run(["run", "--rm", "-d", "--name", "dojo-attack",
+             "--add-host=host.docker.internal:host-gateway",
+             "-e", "SCENARIO=" + scenario,
+             "-v", loaddir + ":/load",
+             "grafana/k6", "run", "/load/attack.js"], timeout=40)
     with _lock:
         _cache["t"] = 0.0  # 次のポーリングで即再取得
 
 
 def stop_attack():
-    run(["rm", "-f", "dojo-attack"])
+    with _attack_lock:
+        run(["rm", "-f", "dojo-attack"])
     with _lock:
         _cache["t"] = 0.0
 
@@ -443,16 +602,27 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if u.path == "/api/attack":
             t = q.get("type", ["ramp"])[0]
-            start_attack(t)
+            # docker run は時間がかかるので裏スレッドへ回し、応答は即返す（ボタンの体感を軽く）
+            threading.Thread(target=start_attack, args=(t,), daemon=True).start()
             self._json({"ok": True, "type": t})
         elif u.path == "/api/stop":
-            stop_attack()
+            threading.Thread(target=stop_attack, daemon=True).start()
             self._json({"ok": True})
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_GET(self):
+        if self.path.startswith("/api/diag"):
+            q = parse_qs(urlparse(self.path).query)
+            name = q.get("name", [""])[0]
+            action = q.get("action", ["logs"])[0]
+            if not re.match(r"^[A-Za-z0-9_.-]+$", name) or action not in DIAG:
+                self._json({"cmd": "", "out": "(不正な要求)"})
+                return
+            args = DIAG[action](name)
+            self._json({"cmd": "docker " + " ".join(args), "out": run_out(args)})
+            return
         if self.path.startswith("/api/logs"):
             q = parse_qs(urlparse(self.path).query)
             name = q.get("name", [""])[0]
