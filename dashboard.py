@@ -394,6 +394,7 @@ HTML = r"""<!DOCTYPE html>
   .canary .lamp{width:13px;height:13px;border-radius:50%;flex:none}
   .canary .st{font-weight:700;font-size:15px}
   .canary .sub{color:var(--txt3);font-size:12px;margin-left:auto;text-align:right}
+  .canary .csub2{font-size:11px;color:var(--txt3);margin-top:2px}
   .canary.up{border-color:#1e5c30} .canary.up .lamp{background:var(--ok);box-shadow:0 0 8px var(--ok)} .canary.up .st{color:var(--ok)}
   .canary.degraded{border-color:#5c4a12} .canary.degraded .lamp{background:var(--warn)} .canary.degraded .st{color:var(--warn)}
   .canary.down{border-color:#5c2a28;animation:pulse 1.3s infinite} .canary.down .lamp{background:var(--danger);box-shadow:0 0 8px var(--danger)} .canary.down .st{color:var(--danger)}
@@ -611,8 +612,10 @@ function renderCanary(s){
   const h=s.health||{state:'up',rate:100,ms:0};
   const label={up:'稼働中',degraded:'劣化（一部エラー）',down:'ダウン'}[h.state]||'—';
   c.className='canary '+h.state;
-  c.innerHTML='<span class="lamp"></span><span class="st">サービス '+label+'</span>'
-    +'<span class="sub">成功率 '+h.rate+'% ／ 応答 '+h.ms+'ms<br>ダッシュボードが実際にアクセスして測定</span>';
+  c.innerHTML='<span class="lamp"></span>'
+    +'<span><span class="st">🎯 対象サイト（app）: '+label+'</span>'
+    +'<div class="csub2">あなたが守る実サイト（localhost:8080）の状態。この道場ダッシュボード自身ではない</div></span>'
+    +'<span class="sub">成功率 '+h.rate+'% ／ 応答 '+h.ms+'ms<br>道場が localhost:8080 を2秒ごとに実測</span>';
 }
 function renderMission(s){
   const el=document.getElementById('mission');
@@ -625,8 +628,8 @@ function renderMission(s){
   if(mStep===0) b='<div class="mtag">MISSION 1</div><h4>DB接続の枯渇を耐えろ</h4>'
     +'<p>DBが同時に受けられる接続には上限がある。今その上限は低く設定されてる。負荷をかけると接続があふれ、新しいリクエストが弾かれてサービスが落ちる。<br>まず攻撃を撃って、<b>本当に落ちる</b>のを見ろ。</p>'
     +'<button class="mbtn" onclick="startMission()">▶ ミッション開始（攻撃を撃つ）</button>';
-  else if(mStep===1) b='<div class="mstep">STEP 1 ／ 観察</div><h4>攻撃中。サービスが壊れるのを待て</h4>'
-    +'<p>上の「サービス状態」を見ろ。攻撃が接続を食いつぶしにいってる。<b>緑じゃなくなったら（黄＝劣化 でも 赤＝ダウン でも）</b>自動で次に進む。<br>※半分のリクエストがエラーになれば、それはもう立派な障害だ。</p>';
+  else if(mStep===1) b='<div class="mstep">STEP 1 ／ 観察</div><h4>攻撃中。対象サイトが壊れるのを待て</h4>'
+    +'<p>上の「🎯 対象サイト（app）」の状態を見ろ。攻撃が接続を食いつぶしにいってる。<b>緑じゃなくなったら（黄＝劣化 でも 赤＝ダウン でも）</b>自動で次に進む。<br>※半分のリクエストがエラーになれば、それはもう立派な障害だ。</p>';
   else if(mStep===2) b='<div class="mstep">STEP 2 ／ 診断</div><h4 class="mok">✓ 落ちた。なぜかを突き止めろ</h4>'
     +'<p>db の接続数を見て、<b>上限に張り付いてないか</b>を確かめろ。</p>'
     +'<button class="mbtn2" onclick="openDiagFor(\'db\',\'conns\')">db の「接続数/上限」を開く</button>'
@@ -639,7 +642,7 @@ function renderMission(s){
     +'<p>ファイルを変えただけでは反映されない。<b>DBを作り直して</b>初めて効く。下を押すと、DBを再構築して攻撃をやり直す（20秒ほど）。</p>'
     +'<button class="mbtn" onclick="applyRetry()">🔧 適用して再挑戦</button>';
   else if(mStep===5) b='<div class="mstep">STEP 5 ／ 検証</div><h4>耐えているか？</h4>'
-    +'<p>DB再構築 → 再攻撃中。上の「サービス状態」が<b>緑（稼働中）</b>を数秒キープすればクリアだ。<br>DB起動に時間がかかるので、緑になるまで少し待て。</p>';
+    +'<p>DB再構築 → 再攻撃中。上の「🎯 対象サイト（app）」が<b>緑（稼働中）</b>を数秒キープすればクリアだ。<br>DB起動に時間がかかるので、緑になるまで少し待て。</p>';
   else if(mStep===6) b='<div class="mclear"><h4>🎉 ミッション1 クリア！</h4>'
     +'<p>接続があふれて落ちたDBを、<b>上限を上げて</b>耐えさせた。「ログで接続枯渇を確認 → 設定を変更 → 適用 → 耐える」を<b>自分の手で1周</b>した。これがSREの基本ループだ。</p>'
     +'<div class="mnote">⚠ 上限を上げるのは<b>対症療法</b>。接続はタダじゃない（1本ごとにメモリを食う）ので無限には上げられない。根本策は<b>コネクションプール</b>（接続を使い回す）や<b>リードレプリカ</b>（読み取りを別DBへ逃がす）＝第2章以降でやる。</div>'
