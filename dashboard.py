@@ -73,7 +73,7 @@ _cache = {"t": 0.0, "data": None}
 _attack_lock = threading.Lock()  # 攻撃の起動/停止を直列化（裏スレッド同士の競合防止）
 
 # サービス健全性カナリア: dashboard 自身が定期的に app を叩き、生きているかを測る
-_canary = {"state": "up", "rate": 100, "ms": 0, "samples": []}
+_canary = {"state": "up", "rate": 100, "ms": 0, "samples": [], "lats": []}
 
 
 def _canary_loop():
@@ -82,7 +82,7 @@ def _canary_loop():
         ok = False
         t0 = time.time()
         try:
-            with urllib.request.urlopen("http://localhost:8080/", timeout=2) as r:
+            with urllib.request.urlopen("http://localhost:8080/", timeout=3) as r:
                 body = r.read(64)
                 ok = (r.status == 200 and body[:2] == b"OK")
         except Exception:
@@ -92,20 +92,41 @@ def _canary_loop():
         s.append(1 if ok else 0)
         if len(s) > 8:
             s.pop(0)
+        lat = _canary["lats"]
+        if ok:
+            lat.append(ms)
+            if len(lat) > 6:
+                lat.pop(0)
         rate = round(sum(s) / len(s) * 100) if s else 100
-        state = "up" if rate >= 80 else ("degraded" if rate >= 35 else "down")
-        _canary.update({"state": state, "rate": rate, "ms": ms})
+        avg = int(sum(lat) / len(lat)) if lat else ms
+        # 成功率が低ければ down、成功しても遅ければ degraded（レイテンシも障害）
+        if rate < 40:
+            state = "down"
+        elif rate < 90 or avg > 500:
+            state = "degraded"
+        else:
+            state = "up"
+        _canary.update({"state": state, "rate": rate, "ms": avg})
         time.sleep(1.2)
 
 
 def read_maxconn():
-    """docker-compose.yml の現在の --max-connections 値を読む（ミッションの修正検知用）。"""
+    """docker-compose.yml の現在の --max-connections 値を読む（ミッション1の修正検知用）。"""
     try:
         with open(os.path.join(ROOT, CHAPTER, "docker-compose.yml"), encoding="utf-8") as f:
             m = re.search(r"--max-connections=(\d+)", f.read())
             return int(m.group(1)) if m else None
     except Exception:
         return None
+
+
+def read_cache_flag():
+    """docker-compose.yml の app に CACHE=1 が入っているか（ミッション2の修正検知用）。"""
+    try:
+        with open(os.path.join(ROOT, CHAPTER, "docker-compose.yml"), encoding="utf-8") as f:
+            return bool(re.search(r'CACHE:\s*["\']?1["\']?', f.read()))
+    except Exception:
+        return False
 
 
 def run(args, timeout=15):
@@ -284,6 +305,7 @@ def gather():
         "tiers": tiers,
         "health": {"state": _canary["state"], "rate": _canary["rate"], "ms": _canary["ms"]},
         "maxconn": read_maxconn(),
+        "cache": read_cache_flag(),
     }
 
 
@@ -412,6 +434,9 @@ HTML = r"""<!DOCTYPE html>
   .mclear{text-align:center;padding:6px 0}
   .mclear h4{color:var(--ok);font-size:20px;margin:4px 0 8px}
   .mnote{color:var(--txt3);font-size:12px;background:#0b0f14;border-radius:6px;padding:9px 12px;text-align:left;line-height:1.7}
+  .mission .ind{margin:2px 0 13px 3px;color:var(--txt3);font-size:12px;line-height:1.65;border-left:2px solid var(--line);padding-left:10px}
+  .mission .mcode{background:#0b0f14;border:1px solid var(--line);border-radius:6px;padding:9px 11px;font-family:ui-monospace,Consolas,monospace;font-size:11px;color:#9ecbff;white-space:pre;overflow-x:auto;margin:7px 0}
+  .mission .mbtn2{margin-right:3px}
 </style></head>
 <body class="easy">
 <div class="wrap">
@@ -576,14 +601,19 @@ function render(s){
   body.innerHTML = h;
 }
 
-// ===== ミッション1: DB接続の枯渇を耐えろ =====
-const M1={attack:'dbflood', file:'chapter1-physical/docker-compose.yml'};
-let mStep=0;  // リロードごとに必ず最初(STEP0)から。stale state を残さない
-let winHold=0;
+// ===== ミッション（複数）=====
+const FILE='chapter1-physical/docker-compose.yml';
+const MISSIONS={
+  1:{title:'DB接続の枯渇を耐えろ', attack:'dbflood'},
+  2:{title:'重い処理でのCPU飽和を耐えろ', attack:'cpubomb'},
+};
+let mNum=1, mStep=0, winHold=0;  // リロードで必ず最初(M1/STEP0)から。stale state を残さない
 function setStep(n){mStep=n;tick();}
-function startMission(){toast('ミッション開始：攻撃を撃つ');fetch('/api/attack?type='+M1.attack,{method:'POST'});setStep(1);pollBurst();}
-function applyRetry(){toast('適用中…DBを作り直して再攻撃（20秒ほど）');fetch('/api/apply?scenario='+M1.attack,{method:'POST'});winHold=0;setStep(5);pollBurst();}
+function curAtk(){return MISSIONS[mNum].attack;}
+function startMission(){toast('ミッション開始：攻撃を撃つ');fetch('/api/attack?type='+curAtk(),{method:'POST'});setStep(1);pollBurst();}
+function applyRetry(){toast('適用中…作り直して再攻撃（20秒ほど）');fetch('/api/apply?scenario='+curAtk(),{method:'POST'});winHold=0;setStep(5);pollBurst();}
 function resetMission(){fetch('/api/stop',{method:'POST'});winHold=0;setStep(0);}
+function nextMission(){fetch('/api/stop',{method:'POST'});mNum=(mNum<2?mNum+1:2);winHold=0;setStep(0);}
 function renderCanary(s){
   const c=document.getElementById('canary');
   const h=s.health||{state:'up',rate:100,ms:0};
@@ -595,35 +625,77 @@ function renderCanary(s){
     +'<div class="csub2">'+atk+'　／　localhost:8080（あなたが守る実サイト。この道場画面ではない）</div></span>'
     +'<span class="sub">成功率 '+h.rate+'% ／ 応答 '+h.ms+'ms</span>';
 }
+function fixed(s){return mNum===1 ? (s.maxconn && s.maxconn!==50) : (s.cache===true);}
+function diagM1(){
+  return '<div class="mstep">STEP 2 ／ 原因を"自分で"突き止める</div><h4 class="mok">✓ 落ちた。ここから捜査だ（上から順に）</h4>'
+    +'<p><b>① まず app のログを見る</b> — サイト本体の悲鳴を読む。</p>'
+    +'<button class="mbtn2" onclick="openDiagFor(\'app\',\'logs\')">app のログを開く（docker logs）</button>'
+    +'<div class="ind">赤い行に <code>Too many connections</code> が出てるはず。これは「app の向こうの DB が接続を断ってる」印。犯人は app でなく <b>DB</b> だ。</div>'
+    +'<p><b>② DB に直接いまの接続数を聞く</b> — 本当に上限か確かめる。</p>'
+    +'<button class="mbtn2" onclick="openDiagFor(\'db\',\'conns\')">db の接続数を調べる（mysql SHOW STATUS）</button>'
+    +'<div class="ind"><code>Threads_connected</code>（今の接続数）が <code>max_connections</code>（上限＝50）に張り付いてたら、<b>接続枯渇 確定</b>。</div>'
+    +'<p><b>③ リソース不足じゃないと裏を取る</b> — CPU/メモリのせいなら話が違う。</p>'
+    +'<button class="mbtn2" onclick="openDiagFor(\'db\',\'stats\')">db の CPU/メモリを見る（docker stats）</button>'
+    +'<div class="ind">CPU も メモリも余ってる → だから「リソース不足」でなく「<b>接続数の上限</b>」が真犯人だと確定できる。</div>'
+    +'<button class="mbtn" onclick="setStep(3)">捜査完了：原因は"接続数の上限" → 直し方へ</button>';
+}
+function diagM2(){
+  return '<div class="mstep">STEP 2 ／ 原因を"自分で"突き止める</div><h4 class="mok">✓ 重くなった。捜査開始（上から順に）</h4>'
+    +'<p><b>① app のログを見る</b> — DBエラーが出てるか？</p>'
+    +'<button class="mbtn2" onclick="openDiagFor(\'app\',\'logs\')">app のログを開く（docker logs）</button>'
+    +'<div class="ind">今回は <code>Too many connections</code> は<b>出ない</b>。DBは無実。犯人は app 側だ。</div>'
+    +'<p><b>② app の CPU/メモリを見る</b> — どっちが天井か。</p>'
+    +'<button class="mbtn2" onclick="openDiagFor(\'app\',\'stats\')">app の CPU/メモリを見る（docker stats）</button>'
+    +'<div class="ind"><b>CPU が上限(100%)に張り付き、メモリは低い</b>。計算で手一杯＝CPUバウンド。</div>'
+    +'<p><b>③ 誰が CPU を食ってるか中を覗く</b></p>'
+    +'<button class="mbtn2" onclick="openDiagFor(\'app\',\'procs\')">app のプロセス上位（ps）</button>'
+    +'<div class="ind"><code>php</code>/<code>apache2</code> が CPU% 上位。1リクエストの計算が重い＝台数でなく"処理そのもの"が犯人。</div>'
+    +'<button class="mbtn" onclick="setStep(3)">捜査完了：原因は"重い計算(CPU)" → 直し方へ</button>';
+}
 function renderMission(s){
   const el=document.getElementById('mission');
   const h=s.health||{state:'up'};
   if(mStep===1 && (h.state==='down'||h.state==='degraded')) mStep=2;
-  if(mStep===3 && s.maxconn && s.maxconn!==50) mStep=4;
+  if(mStep===3 && fixed(s)) mStep=4;
   if(mStep===5){ if(s.attack.active && h.state==='up'){winHold++;}else{winHold=0;} if(winHold>=4) mStep=6; }
+  const M=MISSIONS[mNum];
   let b='';
-  if(mStep===0) b='<div class="mtag">MISSION 1</div><h4>DB接続の枯渇を耐えろ</h4>'
-    +'<p>DBが同時に受けられる接続には上限がある。今その上限は低く設定されてる。負荷をかけると接続があふれ、新しいリクエストが弾かれてサービスが落ちる。<br>まず攻撃を撃って、<b>本当に落ちる</b>のを見ろ。</p>'
-    +'<button class="mbtn" onclick="startMission()">▶ ミッション開始（攻撃を撃つ）</button>';
+  if(mStep===0){
+    b='<div class="mtag">MISSION '+mNum+'</div><h4>'+M.title+'</h4>';
+    b+= (mNum===1)
+      ? '<p>DBが同時に受けられる接続には上限がある。今その上限は低い。負荷をかけると接続があふれ、新規リクエストが弾かれてサイトが落ちる。<br>まず攻撃を撃って、<b>本当に落ちる</b>のを見ろ。</p>'
+      : '<p>このサイトは1リクエストごとに重い計算をしてる。少人数の攻撃でもCPUが焼き切れ、応答が返らなくなる。<br>まず攻撃を撃って、<b>本当に重くなる</b>のを見ろ。</p>';
+    b+='<button class="mbtn" onclick="startMission()">▶ ミッション開始（攻撃を撃つ）</button>';
+  }
   else if(mStep===1) b='<div class="mstep">STEP 1 ／ 観察</div><h4>攻撃中。対象サイトが壊れるのを待て</h4>'
-    +'<p>上の「🎯 対象サイト（app）」の状態を見ろ。攻撃が接続を食いつぶしにいってる。<b>緑じゃなくなったら（黄＝劣化 でも 赤＝ダウン でも）</b>自動で次に進む。<br>※半分のリクエストがエラーになれば、それはもう立派な障害だ。</p>';
-  else if(mStep===2) b='<div class="mstep">STEP 2 ／ 診断</div><h4 class="mok">✓ 落ちた。なぜかを突き止めろ</h4>'
-    +'<p>db の接続数を見て、<b>上限に張り付いてないか</b>を確かめろ。</p>'
-    +'<button class="mbtn2" onclick="openDiagFor(\'db\',\'conns\')">db の「接続数/上限」を開く</button>'
-    +'<p style="color:var(--txt3);font-size:12px">→ <code>Threads_connected</code> が <code>max_connections</code>（50）に達してるはず。それが原因だ。</p>'
-    +'<button class="mbtn" onclick="setStep(3)">確認した → 直し方へ</button>';
-  else if(mStep===3) b='<div class="mstep">STEP 3 ／ 修正（自分の手で）</div><h4>接続の上限を上げろ</h4>'
-    +'<p>エディタで <code>'+M1.file+'</code> を開き、<br>　<code>--max-connections=50</code><br>を<br>　<code>--max-connections=200</code><br>に書き換えて<b>保存</b>しろ。保存すると自動で検知する。</p>'
-    +'<p class="mok">現在の設定値: '+(s.maxconn||'?')+'　… これが 200 になれば次へ</p>';
-  else if(mStep===4) b='<div class="mstep">STEP 4 ／ 適用</div><h4 class="mok">✓ 変更を検知（'+(s.maxconn)+'）</h4>'
-    +'<p>ファイルを変えただけでは反映されない。<b>DBを作り直して</b>初めて効く。下を押すと、DBを再構築して攻撃をやり直す（20秒ほど）。</p>'
+    +'<p>上の「🎯 対象サイト（app）」の状態を見ろ。<b>緑じゃなくなったら（黄でも赤でも）</b>自動で次に進む。<br>※半分のリクエストがエラーになれば、それはもう立派な障害だ。</p>';
+  else if(mStep===2) b=(mNum===1?diagM1():diagM2());
+  else if(mStep===3){
+    b='<div class="mstep">STEP 3 ／ 修正（自分の手で）</div>';
+    if(mNum===1) b+='<h4>接続の上限を上げろ</h4>'
+      +'<p>エディタで <code>'+FILE+'</code> を開き、db の<br>　<code>--max-connections=50</code> を <code>--max-connections=200</code><br>に書き換えて<b>保存</b>しろ。保存すると自動で検知する。</p>'
+      +'<p class="mok">現在の値: '+(s.maxconn||'?')+'　… 200 になれば次へ</p>';
+    else b+='<h4>重い計算を毎回やめる（キャッシュ）</h4>'
+      +'<p>同じ計算を毎リクエスト繰り返すのが無駄。結果を<b>キャッシュ</b>すればCPUが空く。<code>'+FILE+'</code> の <b>app の environment:</b> に1行足せ:</p>'
+      +'<pre class="mcode">    environment:\n      DB_HOST: db\n      ...（既存はそのまま）\n      CACHE: "1"     ← この行を足す</pre>'
+      +'<p>保存すると自動で検知する。</p>'
+      +'<p class="mok">現在: キャッシュ '+(s.cache?'ON':'OFF')+'　… ON になれば次へ</p>';
+  }
+  else if(mStep===4) b='<div class="mstep">STEP 4 ／ 適用</div><h4 class="mok">✓ 変更を検知</h4>'
+    +'<p>ファイルを変えただけでは反映されない。<b>コンテナを作り直して</b>初めて効く。下を押すと、作り直して攻撃をやり直す（20秒ほど）。</p>'
     +'<button class="mbtn" onclick="applyRetry()">🔧 適用して再挑戦</button>';
   else if(mStep===5) b='<div class="mstep">STEP 5 ／ 検証</div><h4>耐えているか？</h4>'
-    +'<p>DB再構築 → 再攻撃中。上の「🎯 対象サイト（app）」が<b>緑（稼働中）</b>を数秒キープすればクリアだ。<br>DB起動に時間がかかるので、緑になるまで少し待て。</p>';
-  else if(mStep===6) b='<div class="mclear"><h4>🎉 ミッション1 クリア！</h4>'
-    +'<p>接続があふれて落ちたDBを、<b>上限を上げて</b>耐えさせた。「ログで接続枯渇を確認 → 設定を変更 → 適用 → 耐える」を<b>自分の手で1周</b>した。これがSREの基本ループだ。</p>'
-    +'<div class="mnote">⚠ 上限を上げるのは<b>対症療法</b>。接続はタダじゃない（1本ごとにメモリを食う）ので無限には上げられない。根本策は<b>コネクションプール</b>（接続を使い回す）や<b>リードレプリカ</b>（読み取りを別DBへ逃がす）＝第2章以降でやる。</div>'
-    +'<button class="mbtn2" onclick="stopAttack()">攻撃を止める</button> <button class="mbtn2" onclick="resetMission()">もう一度</button></div>';
+    +'<p>作り直し → 再攻撃中。上の「🎯 対象サイト（app）」が<b>緑（稼働中）</b>を数秒キープすればクリアだ。<br>起動に時間がかかるので、緑になるまで少し待て。</p>';
+  else if(mStep===6){
+    b='<div class="mclear"><h4>🎉 ミッション'+mNum+' クリア！</h4>';
+    if(mNum===1) b+='<p>接続があふれて落ちたDBを、<b>上限を上げて</b>耐えさせた。「ログで確認 → 設定変更 → 適用 → 耐える」を自分の手で1周した。</p>'
+      +'<div class="mnote">⚠ 上限↑は対症療法。接続はメモリを食うので無限には上げられない。根本策は<b>コネクションプール</b>や<b>リードレプリカ</b>（第2章以降）。</div>';
+    else b+='<p>毎回の重い計算を<b>キャッシュ</b>してCPUを空け、耐えさせた。今回は犯人が<b>DBでなくapp（CPU）</b>だったのを、ログと docker stats で自分で切り分けたのが肝だ。</p>'
+      +'<div class="mnote">⚠ キャッシュは万能じゃない。古い結果が返るリスク（TTL/無効化の設計）があり、毎回変わるデータには効かない。だが「同じ計算・同じ結果の繰り返し」には絶大。</div>';
+    b+='<button class="mbtn2" onclick="stopAttack()">攻撃を止める</button>';
+    b+= (mNum<2) ? '<button class="mbtn" onclick="nextMission()">▶ 次のミッションへ</button>' : '<span class="mok" style="margin-left:6px">全ミッション制覇！第2章(複数台+LB)は準備中。</span>';
+    b+='<button class="mbtn2" onclick="resetMission()">もう一度</button></div>';
+  }
   if(mStep>0 && mStep<6) b+='<div style="margin-top:11px"><a href="#" onclick="resetMission();return false" style="color:var(--txt3);font-size:11px">↺ 最初からやり直す（攻撃も止める）</a></div>';
   el.innerHTML='<div class="mission">'+b+'</div>';
 }
@@ -663,7 +735,7 @@ def apply_and_retry(scenario):
     compose = os.path.join(ROOT, CHAPTER, "docker-compose.yml")
     with _attack_lock:
         run(["rm", "-f", "dojo-attack"])
-    run(["compose", "-f", compose, "up", "-d", "db"], timeout=120)
+    run(["compose", "-f", compose, "up", "-d"], timeout=120)  # 変わったサービスを作り直す(db or app)
     time.sleep(6)
     start_attack(scenario)
 
