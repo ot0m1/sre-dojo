@@ -426,17 +426,6 @@ HTML = r"""<!DOCTYPE html>
   <div id="canary"></div>
   <div id="mission"></div>
 
-  <div class="attacks">
-    <span class="albl">攻撃を撃つ:</span>
-    <button onclick="fire('ramp')">じわ増し</button>
-    <button onclick="fire('spike')">スパイク急襲</button>
-    <button onclick="fire('cpubomb')">重い処理</button>
-    <button onclick="fire('dbflood')">DB遅延</button>
-    <button class="stopbtn" onclick="stopAttack()">■ 停止</button>
-  </div>
-  <div class="alegend easyonly" id="alegend"></div>
-
-  <div id="attack" class="attack"></div>
   <div id="body"></div>
 </div>
 <div id="logmodal" class="logmodal hidden">
@@ -469,7 +458,7 @@ function copyCmd(el){const t=el.textContent;if(navigator.clipboard)navigator.cli
 function pollBurst(){[250,800,1600,2600,3600].forEach(function(ms){setTimeout(tick,ms);});}
 function fire(t){toast('攻撃を起動中… '+ATTACKS[t][0]);fetch('/api/attack?type='+t,{method:'POST'});pollBurst();}
 function stopAttack(){toast('攻撃を停止中…');fetch('/api/stop',{method:'POST'});pollBurst();}
-document.getElementById('alegend').innerHTML='<b>各攻撃の狙い（易しいモード）:</b><br>'+Object.keys(ATTACKS).map(k=>'・<b>'+ATTACKS[k][0]+'</b> … '+ATTACKS[k][1]).join('<br>');
+// 自由攻撃ボタンは撤去。攻撃はミッションが駆動する。
 
 const DIAG_ACTIONS={
   app:[['logs','ログ'],['procs','プロセス上位(CPU)'],['workers','ワーカー数'],['stats','リソース']],
@@ -559,18 +548,6 @@ function render(s){
   ROLE2NAME={};
   if(s.tiers){['lb','app','db'].forEach(function(r){if(s.tiers[r]&&s.tiers[r][0])ROLE2NAME[r]=s.tiers[r][0].name;});}
 
-  const a = document.getElementById('attack');
-  if(s.attack.active){
-    a.className='attack on';
-    a.innerHTML='<div class="h">⚠ 攻撃 進行中: '+s.attack.name+'</div>'
-      +'<div>'+s.attack.detail+' <b style="color:#ff8a80">／ ■停止を押すまで継続</b></div>'
-      +(MODE==='easy'?'<div class="hint" style="margin-top:5px">この攻撃が来ている間に、下の各コンテナのCPU/メモリがどう動くかを見ろ。先に上限へ張り付いた箱が犯人候補。</div>':'');
-  } else {
-    a.className='attack';
-    a.innerHTML='<div class="h">攻撃なし（待機中）</div>'
-      +(MODE==='easy'?'<div class="hint" style="margin-top:4px">上の攻撃ボタンを押すと、ここに攻撃内容と<b>攻略手順</b>が出て、下のバーが動き出す。</div>':'');
-  }
-
   renderCanary(s);
   renderMission(s);
 
@@ -601,9 +578,9 @@ function render(s){
 
 // ===== ミッション1: DB接続の枯渇を耐えろ =====
 const M1={attack:'dbflood', file:'chapter1-physical/docker-compose.yml'};
-let mStep=parseInt(localStorage.getItem('m1step')||'0',10);
+let mStep=0;  // リロードごとに必ず最初(STEP0)から。stale state を残さない
 let winHold=0;
-function setStep(n){mStep=n;localStorage.setItem('m1step',String(n));tick();}
+function setStep(n){mStep=n;tick();}
 function startMission(){toast('ミッション開始：攻撃を撃つ');fetch('/api/attack?type='+M1.attack,{method:'POST'});setStep(1);pollBurst();}
 function applyRetry(){toast('適用中…DBを作り直して再攻撃（20秒ほど）');fetch('/api/apply?scenario='+M1.attack,{method:'POST'});winHold=0;setStep(5);pollBurst();}
 function resetMission(){fetch('/api/stop',{method:'POST'});winHold=0;setStep(0);}
@@ -611,11 +588,12 @@ function renderCanary(s){
   const c=document.getElementById('canary');
   const h=s.health||{state:'up',rate:100,ms:0};
   const label={up:'稼働中',degraded:'劣化（一部エラー）',down:'ダウン'}[h.state]||'—';
+  const atk=(s.attack&&s.attack.active)?('🔴 攻撃中：'+s.attack.name):'⚪ 攻撃なし';
   c.className='canary '+h.state;
   c.innerHTML='<span class="lamp"></span>'
     +'<span><span class="st">🎯 対象サイト（app）: '+label+'</span>'
-    +'<div class="csub2">あなたが守る実サイト（localhost:8080）の状態。この道場ダッシュボード自身ではない</div></span>'
-    +'<span class="sub">成功率 '+h.rate+'% ／ 応答 '+h.ms+'ms<br>道場が localhost:8080 を2秒ごとに実測</span>';
+    +'<div class="csub2">'+atk+'　／　localhost:8080（あなたが守る実サイト。この道場画面ではない）</div></span>'
+    +'<span class="sub">成功率 '+h.rate+'% ／ 応答 '+h.ms+'ms</span>';
 }
 function renderMission(s){
   const el=document.getElementById('mission');
@@ -623,7 +601,6 @@ function renderMission(s){
   if(mStep===1 && (h.state==='down'||h.state==='degraded')) mStep=2;
   if(mStep===3 && s.maxconn && s.maxconn!==50) mStep=4;
   if(mStep===5){ if(s.attack.active && h.state==='up'){winHold++;}else{winHold=0;} if(winHold>=4) mStep=6; }
-  localStorage.setItem('m1step',String(mStep));
   let b='';
   if(mStep===0) b='<div class="mtag">MISSION 1</div><h4>DB接続の枯渇を耐えろ</h4>'
     +'<p>DBが同時に受けられる接続には上限がある。今その上限は低く設定されてる。負荷をかけると接続があふれ、新しいリクエストが弾かれてサービスが落ちる。<br>まず攻撃を撃って、<b>本当に落ちる</b>のを見ろ。</p>'
@@ -647,6 +624,7 @@ function renderMission(s){
     +'<p>接続があふれて落ちたDBを、<b>上限を上げて</b>耐えさせた。「ログで接続枯渇を確認 → 設定を変更 → 適用 → 耐える」を<b>自分の手で1周</b>した。これがSREの基本ループだ。</p>'
     +'<div class="mnote">⚠ 上限を上げるのは<b>対症療法</b>。接続はタダじゃない（1本ごとにメモリを食う）ので無限には上げられない。根本策は<b>コネクションプール</b>（接続を使い回す）や<b>リードレプリカ</b>（読み取りを別DBへ逃がす）＝第2章以降でやる。</div>'
     +'<button class="mbtn2" onclick="stopAttack()">攻撃を止める</button> <button class="mbtn2" onclick="resetMission()">もう一度</button></div>';
+  if(mStep>0 && mStep<6) b+='<div style="margin-top:11px"><a href="#" onclick="resetMission();return false" style="color:var(--txt3);font-size:11px">↺ 最初からやり直す（攻撃も止める）</a></div>';
   el.innerHTML='<div class="mission">'+b+'</div>';
 }
 
