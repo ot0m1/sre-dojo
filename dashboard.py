@@ -505,16 +505,20 @@ function openLog(name, role){curName=name;curRole=(DIAG_ACTIONS[role]?role:'app'
   clearInterval(diagTimer);diagTimer=setInterval(runDiag,2500);}
 function setAction(a){curAction=a;
   Array.prototype.forEach.call(document.querySelectorAll('#diagbtns button'),function(b){b.classList.toggle('on',b.getAttribute('data-a')===a);});
+  document.getElementById('diagcmd').textContent='$ …';
+  document.getElementById('logbody').innerHTML='取得中…';   // 切替時に即クリア（古い内容の残像を消す）
   runDiag();}
 function closeLog(){document.getElementById('logmodal').classList.add('hidden');curName=null;clearInterval(diagTimer);}
 function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function fmtLog(t){return t.split('\n').map(function(l){var e=escHtml(l);
   return /error|too many connections|fatal|503|cannot|denied|aborted|refused|warn|Sleep/i.test(l)?'<span class="lerr">'+e+'</span>':e;}).join('\n');}
 async function runDiag(){if(!curName)return;
-  try{const r=await fetch('/api/diag?name='+encodeURIComponent(curName)+'&action='+curAction);const j=await r.json();
+  const reqName=curName, reqAction=curAction;   // リクエスト発行時のタブ/対象を覚えておく
+  try{const r=await fetch('/api/diag?name='+encodeURIComponent(reqName)+'&action='+reqAction);const j=await r.json();
+    if(reqName!==curName || reqAction!==curAction) return;   // 応答が返る頃にタブ/対象が変わっていたら捨てる（別タブを上書きしない）
     document.getElementById('diagcmd').textContent='$ '+(j.cmd||'');
     const b=document.getElementById('logbody');const atBottom=b.scrollTop+b.clientHeight>=b.scrollHeight-30;
-    b.innerHTML=fmtLog(j.out||'(空)');if(curAction==='logs'&&atBottom)b.scrollTop=b.scrollHeight;}catch(e){}}
+    b.innerHTML=fmtLog(j.out||'(空)');if(reqAction==='logs'&&atBottom)b.scrollTop=b.scrollHeight;}catch(e){}}
 
 let ROLE2NAME={};
 function openDiagFor(role, action){
