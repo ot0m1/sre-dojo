@@ -625,8 +625,8 @@ function renderMission(s){
   if(mStep===0) b='<div class="mtag">MISSION 1</div><h4>DB接続の枯渇を耐えろ</h4>'
     +'<p>DBが同時に受けられる接続には上限がある。今その上限は低く設定されてる。負荷をかけると接続があふれ、新しいリクエストが弾かれてサービスが落ちる。<br>まず攻撃を撃って、<b>本当に落ちる</b>のを見ろ。</p>'
     +'<button class="mbtn" onclick="startMission()">▶ ミッション開始（攻撃を撃つ）</button>';
-  else if(mStep===1) b='<div class="mstep">STEP 1 ／ 観察</div><h4>攻撃中。サービスが落ちるのを待て</h4>'
-    +'<p>上の「サービス状態」を見ろ。攻撃が接続を食いつぶしにいってる。<b>赤（ダウン）</b>になったら自動で次に進む。</p>';
+  else if(mStep===1) b='<div class="mstep">STEP 1 ／ 観察</div><h4>攻撃中。サービスが壊れるのを待て</h4>'
+    +'<p>上の「サービス状態」を見ろ。攻撃が接続を食いつぶしにいってる。<b>緑じゃなくなったら（黄＝劣化 でも 赤＝ダウン でも）</b>自動で次に進む。<br>※半分のリクエストがエラーになれば、それはもう立派な障害だ。</p>';
   else if(mStep===2) b='<div class="mstep">STEP 2 ／ 診断</div><h4 class="mok">✓ 落ちた。なぜかを突き止めろ</h4>'
     +'<p>db の接続数を見て、<b>上限に張り付いてないか</b>を確かめろ。</p>'
     +'<button class="mbtn2" onclick="openDiagFor(\'db\',\'conns\')">db の「接続数/上限」を開く</button>'
