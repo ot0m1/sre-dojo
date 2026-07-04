@@ -1,0 +1,39 @@
+name: dojo-ch1
+
+# 「物理時代の1台」を模した素朴な構成。
+# app(Web+アプリ) と db(MySQL) を、わざと貧弱なリソースに縛ってある。
+# これで本物の負荷をかけると、本当に処理落ち・接続あふれが起きる。
+
+services:
+  app:
+    build: ./app
+    ports:
+      - "8080:80"
+    environment:
+      DB_HOST: db
+      DB_USER: app
+      DB_PASS: app
+      DB_NAME: shop
+    depends_on:
+      - db
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"      # CPU 半コアだけ。貧弱な1台のつもり
+          memory: 256M
+
+  db:
+    image: mysql:8.0
+    command: --max-connections=50   # DBが同時にさばける接続は50まで（ここが最初の壁になりやすい）
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: shop
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app
+    volumes:
+      - ./app/db-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
