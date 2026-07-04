@@ -72,6 +72,41 @@ _lock = threading.Lock()
 _cache = {"t": 0.0, "data": None}
 _attack_lock = threading.Lock()  # 攻撃の起動/停止を直列化（裏スレッド同士の競合防止）
 
+# サービス健全性カナリア: dashboard 自身が定期的に app を叩き、生きているかを測る
+_canary = {"state": "up", "rate": 100, "ms": 0, "samples": []}
+
+
+def _canary_loop():
+    import urllib.request
+    while True:
+        ok = False
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen("http://localhost:8080/", timeout=2) as r:
+                body = r.read(64)
+                ok = (r.status == 200 and body[:2] == b"OK")
+        except Exception:
+            ok = False
+        ms = int((time.time() - t0) * 1000)
+        s = _canary["samples"]
+        s.append(1 if ok else 0)
+        if len(s) > 8:
+            s.pop(0)
+        rate = round(sum(s) / len(s) * 100) if s else 100
+        state = "up" if rate >= 80 else ("degraded" if rate >= 35 else "down")
+        _canary.update({"state": state, "rate": rate, "ms": ms})
+        time.sleep(1.2)
+
+
+def read_maxconn():
+    """docker-compose.yml の現在の --max-connections 値を読む（ミッションの修正検知用）。"""
+    try:
+        with open(os.path.join(ROOT, CHAPTER, "docker-compose.yml"), encoding="utf-8") as f:
+            m = re.search(r"--max-connections=(\d+)", f.read())
+            return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
 
 def run(args, timeout=15):
     try:
@@ -247,6 +282,8 @@ def gather():
         "up": bool(tiers["lb"] or tiers["app"] or tiers["db"]),
         "attack": attack,
         "tiers": tiers,
+        "health": {"state": _canary["state"], "rate": _canary["rate"], "ms": _canary["ms"]},
+        "maxconn": read_maxconn(),
     }
 
 
@@ -353,6 +390,27 @@ HTML = r"""<!DOCTYPE html>
   .pb .look{color:var(--txt3);font-size:12px}
   .pb .fix{background:#0f2a16;border:1px solid #1e5c30;border-radius:6px;padding:9px 12px;margin-top:6px;color:#c9f0d4;line-height:1.7}
   .pb .wrong{color:var(--txt3);font-size:12px;margin-top:8px}
+  .canary{display:flex;align-items:center;gap:11px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:11px 16px;margin-bottom:12px}
+  .canary .lamp{width:13px;height:13px;border-radius:50%;flex:none}
+  .canary .st{font-weight:700;font-size:15px}
+  .canary .sub{color:var(--txt3);font-size:12px;margin-left:auto;text-align:right}
+  .canary.up{border-color:#1e5c30} .canary.up .lamp{background:var(--ok);box-shadow:0 0 8px var(--ok)} .canary.up .st{color:var(--ok)}
+  .canary.degraded{border-color:#5c4a12} .canary.degraded .lamp{background:var(--warn)} .canary.degraded .st{color:var(--warn)}
+  .canary.down{border-color:#5c2a28;animation:pulse 1.3s infinite} .canary.down .lamp{background:var(--danger);box-shadow:0 0 8px var(--danger)} .canary.down .st{color:var(--danger)}
+  .mission{background:var(--panel);border:1px solid var(--accent);border-left:3px solid var(--accent);border-radius:var(--radius);padding:15px 17px;margin-bottom:14px}
+  .mission .mtag{font-size:11px;color:var(--accent);font-weight:600;letter-spacing:.05em}
+  .mission h4{margin:3px 0 9px;font-size:16px;color:var(--txt)}
+  .mission p{margin:7px 0;color:var(--txt2);font-size:13px;line-height:1.75}
+  .mission code{background:#0b0f14;padding:2px 7px;border-radius:4px;color:#9ecbff;font-family:ui-monospace,Consolas,monospace}
+  .mbtn{background:var(--accent);color:#001;border:0;border-radius:8px;padding:10px 17px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;margin-top:9px}
+  .mbtn:hover{background:#5cb0ff}
+  .mbtn2{background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer;font-family:inherit;margin-top:9px}
+  .mbtn2:hover{border-color:var(--accent)}
+  .mstep{display:inline-block;background:var(--accent);color:#001;font-size:11px;font-weight:700;border-radius:999px;padding:2px 9px;margin-bottom:4px}
+  .mok{color:var(--ok);font-weight:600}
+  .mclear{text-align:center;padding:6px 0}
+  .mclear h4{color:var(--ok);font-size:20px;margin:4px 0 8px}
+  .mnote{color:var(--txt3);font-size:12px;background:#0b0f14;border-radius:6px;padding:9px 12px;text-align:left;line-height:1.7}
 </style></head>
 <body class="easy">
 <div class="wrap">
@@ -363,6 +421,9 @@ HTML = r"""<!DOCTYPE html>
       <button id="b-hard" onclick="setMode('hard')">難しい（数値だけ）</button>
     </div>
   </div>
+
+  <div id="canary"></div>
+  <div id="mission"></div>
 
   <div class="attacks">
     <span class="albl">攻撃を撃つ:</span>
@@ -375,26 +436,7 @@ HTML = r"""<!DOCTYPE html>
   <div class="alegend easyonly" id="alegend"></div>
 
   <div id="attack" class="attack"></div>
-  <div id="playbook"></div>
   <div id="body"></div>
-
-  <div class="help easyonly">
-    <h3>SRE診断の型（易しいモードのみ・答えは出さない、推測はお前がやる）</h3>
-    <p><b>観察 → 仮説 → 確認 → 対処</b>。まず攻撃を撃って「どのバーが先に上限へ張り付くか」を観察。犯人を仮説したら、そのカードの <b>🔍診断する</b> ボタンで確認コマンドを撃つ。合ってたら構成を直す。</p>
-    <h3 style="margin-top:15px">どの箱でも使う3つの基本コマンド</h3>
-    <ul>
-      <li><code>docker stats &lt;名前&gt;</code> … 生のCPU/メモリ（このダッシュボードが常時見せてる物）。</li>
-      <li><code>docker logs --tail 60 &lt;名前&gt;</code> … エラーの悲鳴（<code>503</code> / <code>Too many connections</code> / <code>Fatal</code>）。</li>
-      <li><code>docker exec -it &lt;名前&gt; sh</code> … <b>箱の中に入る</b>。中で <code>top</code> / <code>ps aux</code> で誰がCPU/メモリを食ってるか見る。診断パネルのボタンはこれを代わりに撃ってる。</li>
-    </ul>
-    <h3 style="margin-top:15px">症状 → 撃つべき確認</h3>
-    <ul>
-      <li><b>CPUが上限で応答が遅い</b> → 診断パネルの「プロセス上位」。<code>apache2</code>/<code>php</code> がCPUを食ってれば計算過多かリクエスト過多。</li>
-      <li><b>メモリが上限近い・行列待ち</b> → 「ワーカー数」。<code>apache2</code> プロセスが多数＝同時処理がRAMで頭打ち＝新規は順番待ち。</li>
-      <li><b>CPUもメモリも余ってるのに遅い</b> → db の「接続数/上限」と「実行中クエリ」。接続あふれか、<code>Sleep</code>/遅いクエリで待たされてる。</li>
-    </ul>
-    <p style="margin:8px 0 0">読んで「これが原因かな？」と思ったら、その推測をチャットの俺にぶつけろ。合ってたら、どこをどう直せば耐えるかを返す。</p>
-  </div>
 </div>
 <div id="logmodal" class="logmodal hidden">
   <div class="logbox">
@@ -492,7 +534,7 @@ function card(c){
   const dot = c.status==='running'?'ok':'bad';
   const cpuFill = fillClass(c.cpuOfCap), memFill = fillClass(c.memPerc);
   const wide = MODE==='easy' ? ' easyw' : '';
-  const chint = MODE==='easy' ? '<div class="chint">'+(HINTS[c.role]||'')+'</div>' : '';
+  const chint = '';
   let logs = '';
   if(MODE==='easy'){
     logs = '<div class="logcmd">ターミナル派はこれでも見れる（クリックでコピー）:'
@@ -528,7 +570,8 @@ function render(s){
       +(MODE==='easy'?'<div class="hint" style="margin-top:4px">上の攻撃ボタンを押すと、ここに攻撃内容と<b>攻略手順</b>が出て、下のバーが動き出す。</div>':'');
   }
 
-  renderPlaybook(s);
+  renderCanary(s);
+  renderMission(s);
 
   const body = document.getElementById('body');
   if(!s.up){
@@ -553,6 +596,55 @@ function render(s){
   }
   h += '</div>';
   body.innerHTML = h;
+}
+
+// ===== ミッション1: DB接続の枯渇を耐えろ =====
+const M1={attack:'dbflood', file:'chapter1-physical/docker-compose.yml'};
+let mStep=parseInt(localStorage.getItem('m1step')||'0',10);
+let winHold=0;
+function setStep(n){mStep=n;localStorage.setItem('m1step',String(n));tick();}
+function startMission(){toast('ミッション開始：攻撃を撃つ');fetch('/api/attack?type='+M1.attack,{method:'POST'});setStep(1);pollBurst();}
+function applyRetry(){toast('適用中…DBを作り直して再攻撃（20秒ほど）');fetch('/api/apply?scenario='+M1.attack,{method:'POST'});winHold=0;setStep(5);pollBurst();}
+function resetMission(){fetch('/api/stop',{method:'POST'});winHold=0;setStep(0);}
+function renderCanary(s){
+  const c=document.getElementById('canary');
+  const h=s.health||{state:'up',rate:100,ms:0};
+  const label={up:'稼働中',degraded:'劣化（一部エラー）',down:'ダウン'}[h.state]||'—';
+  c.className='canary '+h.state;
+  c.innerHTML='<span class="lamp"></span><span class="st">サービス '+label+'</span>'
+    +'<span class="sub">成功率 '+h.rate+'% ／ 応答 '+h.ms+'ms<br>ダッシュボードが実際にアクセスして測定</span>';
+}
+function renderMission(s){
+  const el=document.getElementById('mission');
+  const h=s.health||{state:'up'};
+  if(mStep===1 && (h.state==='down'||h.state==='degraded')) mStep=2;
+  if(mStep===3 && s.maxconn && s.maxconn!==50) mStep=4;
+  if(mStep===5){ if(s.attack.active && h.state==='up'){winHold++;}else{winHold=0;} if(winHold>=4) mStep=6; }
+  localStorage.setItem('m1step',String(mStep));
+  let b='';
+  if(mStep===0) b='<div class="mtag">MISSION 1</div><h4>DB接続の枯渇を耐えろ</h4>'
+    +'<p>DBが同時に受けられる接続には上限がある。今その上限は低く設定されてる。負荷をかけると接続があふれ、新しいリクエストが弾かれてサービスが落ちる。<br>まず攻撃を撃って、<b>本当に落ちる</b>のを見ろ。</p>'
+    +'<button class="mbtn" onclick="startMission()">▶ ミッション開始（攻撃を撃つ）</button>';
+  else if(mStep===1) b='<div class="mstep">STEP 1 ／ 観察</div><h4>攻撃中。サービスが落ちるのを待て</h4>'
+    +'<p>上の「サービス状態」を見ろ。攻撃が接続を食いつぶしにいってる。<b>赤（ダウン）</b>になったら自動で次に進む。</p>';
+  else if(mStep===2) b='<div class="mstep">STEP 2 ／ 診断</div><h4 class="mok">✓ 落ちた。なぜかを突き止めろ</h4>'
+    +'<p>db の接続数を見て、<b>上限に張り付いてないか</b>を確かめろ。</p>'
+    +'<button class="mbtn2" onclick="openDiagFor(\'db\',\'conns\')">db の「接続数/上限」を開く</button>'
+    +'<p style="color:var(--txt3);font-size:12px">→ <code>Threads_connected</code> が <code>max_connections</code>（50）に達してるはず。それが原因だ。</p>'
+    +'<button class="mbtn" onclick="setStep(3)">確認した → 直し方へ</button>';
+  else if(mStep===3) b='<div class="mstep">STEP 3 ／ 修正（自分の手で）</div><h4>接続の上限を上げろ</h4>'
+    +'<p>エディタで <code>'+M1.file+'</code> を開き、<br>　<code>--max-connections=50</code><br>を<br>　<code>--max-connections=200</code><br>に書き換えて<b>保存</b>しろ。保存すると自動で検知する。</p>'
+    +'<p class="mok">現在の設定値: '+(s.maxconn||'?')+'　… これが 200 になれば次へ</p>';
+  else if(mStep===4) b='<div class="mstep">STEP 4 ／ 適用</div><h4 class="mok">✓ 変更を検知（'+(s.maxconn)+'）</h4>'
+    +'<p>ファイルを変えただけでは反映されない。<b>DBを作り直して</b>初めて効く。下を押すと、DBを再構築して攻撃をやり直す（20秒ほど）。</p>'
+    +'<button class="mbtn" onclick="applyRetry()">🔧 適用して再挑戦</button>';
+  else if(mStep===5) b='<div class="mstep">STEP 5 ／ 検証</div><h4>耐えているか？</h4>'
+    +'<p>DB再構築 → 再攻撃中。上の「サービス状態」が<b>緑（稼働中）</b>を数秒キープすればクリアだ。<br>DB起動に時間がかかるので、緑になるまで少し待て。</p>';
+  else if(mStep===6) b='<div class="mclear"><h4>🎉 ミッション1 クリア！</h4>'
+    +'<p>接続があふれて落ちたDBを、<b>上限を上げて</b>耐えさせた。「ログで接続枯渇を確認 → 設定を変更 → 適用 → 耐える」を<b>自分の手で1周</b>した。これがSREの基本ループだ。</p>'
+    +'<div class="mnote">⚠ 上限を上げるのは<b>対症療法</b>。接続はタダじゃない（1本ごとにメモリを食う）ので無限には上げられない。根本策は<b>コネクションプール</b>（接続を使い回す）や<b>リードレプリカ</b>（読み取りを別DBへ逃がす）＝第2章以降でやる。</div>'
+    +'<button class="mbtn2" onclick="stopAttack()">攻撃を止める</button> <button class="mbtn2" onclick="resetMission()">もう一度</button></div>';
+  el.innerHTML='<div class="mission">'+b+'</div>';
 }
 
 async function tick(){
@@ -585,6 +677,16 @@ def stop_attack():
         _cache["t"] = 0.0
 
 
+def apply_and_retry(scenario):
+    """設定変更(compose)を反映するため db を作り直し、その後 攻撃を撃ち直す。"""
+    compose = os.path.join(ROOT, CHAPTER, "docker-compose.yml")
+    with _attack_lock:
+        run(["rm", "-f", "dojo-attack"])
+    run(["compose", "-f", compose, "up", "-d", "db"], timeout=120)
+    time.sleep(6)
+    start_attack(scenario)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -607,6 +709,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "type": t})
         elif u.path == "/api/stop":
             threading.Thread(target=stop_attack, daemon=True).start()
+            self._json({"ok": True})
+        elif u.path == "/api/apply":
+            sc = q.get("scenario", ["dbflood"])[0]
+            threading.Thread(target=apply_and_retry, args=(sc,), daemon=True).start()
             self._json({"ok": True})
         else:
             self.send_response(404)
@@ -651,4 +757,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     print(f"SRE道場 ダッシュボード: http://localhost:{PORT}  (章: {CHAPTER})")
     print("止めるには この窓で Ctrl+C")
+    threading.Thread(target=_canary_loop, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
