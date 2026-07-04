@@ -1,5 +1,5 @@
 <#
-  Ops道場ドライバ。PowerShellから叩く。
+  SRE道場ドライバ。PowerShellから叩く。
   例:
     ./dojo.ps1 up
     ./dojo.ps1 open

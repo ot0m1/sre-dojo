@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ops道場 ライブダッシュボード（標準ライブラリのみ・依存ゼロ）
+SRE道場 ライブダッシュボード（標準ライブラリのみ・依存ゼロ）
 
 Docker の実状態を読んで、ブラウザに:
   - 今の構成図（起動中コンテナから自動生成、変更すると即反映）
@@ -190,7 +190,7 @@ def get_state():
 HTML = r"""<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ops道場 ダッシュボード</title>
+<title>SRE道場 ダッシュボード</title>
 <style>
   :root{
     --bg:#0d1117;--panel:#161b22;--panel2:#1c2330;--line:#2a313c;
@@ -263,7 +263,7 @@ HTML = r"""<!DOCTYPE html>
 <body class="easy">
 <div class="wrap">
   <div class="top">
-    <div><h1>🥋 Ops道場 ダッシュボード</h1><div class="clock" id="clock"></div></div>
+    <div><h1>🥋 SRE道場 ダッシュボード</h1><div class="clock" id="clock"></div></div>
     <div class="seg">
       <button id="b-easy" class="on" onclick="setMode('easy')">易しい（解説つき）</button>
       <button id="b-hard" onclick="setMode('hard')">難しい（数値だけ）</button>
@@ -479,6 +479,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Ops道場 ダッシュボード: http://localhost:{PORT}  (章: {CHAPTER})")
+    print(f"SRE道場 ダッシュボード: http://localhost:{PORT}  (章: {CHAPTER})")
     print("止めるには この窓で Ctrl+C")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
