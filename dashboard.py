@@ -610,7 +610,7 @@ const MISSIONS={
 let mNum=1, mStep=0, winHold=0;  // リロードで必ず最初(M1/STEP0)から。stale state を残さない
 function setStep(n){mStep=n;tick();}
 function curAtk(){return MISSIONS[mNum].attack;}
-function startMission(){toast('ミッション開始：攻撃を撃つ');fetch('/api/attack?type='+curAtk(),{method:'POST'});setStep(1);pollBurst();}
+function startMission(){toast('構成を初期状態に戻して開始…');fetch('/api/startmission?scenario='+curAtk(),{method:'POST'});setStep(1);pollBurst();}
 function applyRetry(){toast('適用中…作り直して再攻撃（20秒ほど）');fetch('/api/apply?scenario='+curAtk(),{method:'POST'});winHold=0;setStep(5);pollBurst();}
 function resetMission(){fetch('/api/stop',{method:'POST'});winHold=0;setStep(0);}
 function nextMission(){fetch('/api/stop',{method:'POST'});mNum=(mNum<2?mNum+1:2);winHold=0;setStep(0);}
@@ -655,7 +655,7 @@ function diagM2(){
 function renderMission(s){
   const el=document.getElementById('mission');
   const h=s.health||{state:'up'};
-  if(mStep===1 && (h.state==='down'||h.state==='degraded')) mStep=2;
+  if(mStep===1 && s.attack.active && (h.state==='down'||h.state==='degraded')) mStep=2;
   if(mStep===3 && fixed(s)) mStep=4;
   if(mStep===5){ if(s.attack.active && h.state==='up'){winHold++;}else{winHold=0;} if(winHold>=4) mStep=6; }
   const M=MISSIONS[mNum];
@@ -667,8 +667,8 @@ function renderMission(s){
       : '<p>このサイトは1リクエストごとに重い計算をしてる。少人数の攻撃でもCPUが焼き切れ、応答が返らなくなる。<br>まず攻撃を撃って、<b>本当に重くなる</b>のを見ろ。</p>';
     b+='<button class="mbtn" onclick="startMission()">▶ ミッション開始（攻撃を撃つ）</button>';
   }
-  else if(mStep===1) b='<div class="mstep">STEP 1 ／ 観察</div><h4>攻撃中。対象サイトが壊れるのを待て</h4>'
-    +'<p>上の「🎯 対象サイト（app）」の状態を見ろ。<b>緑じゃなくなったら（黄でも赤でも）</b>自動で次に進む。<br>※半分のリクエストがエラーになれば、それはもう立派な障害だ。</p>';
+  else if(mStep===1) b='<div class="mstep">STEP 1 ／ 観察</div><h4>構成を初期化 → 攻撃中。壊れるのを待て</h4>'
+    +'<p>まず構成を"壊れた初期状態"に戻してから攻撃してる（十数秒かかることがある）。上の「🎯 対象サイト（app）」が<b>緑じゃなくなったら（黄でも赤でも）</b>自動で次に進む。<br>※半分のリクエストがエラーになれば、それはもう立派な障害だ。</p>';
   else if(mStep===2) b=(mNum===1?diagM1():diagM2());
   else if(mStep===3){
     b='<div class="mstep">STEP 3 ／ 修正（自分の手で）</div>';
@@ -731,11 +731,37 @@ def stop_attack():
 
 
 def apply_and_retry(scenario):
-    """設定変更(compose)を反映するため db を作り直し、その後 攻撃を撃ち直す。"""
+    """設定変更(compose)を反映するため作り直し、その後 攻撃を撃ち直す。"""
     compose = os.path.join(ROOT, CHAPTER, "docker-compose.yml")
     with _attack_lock:
         run(["rm", "-f", "dojo-attack"])
     run(["compose", "-f", compose, "up", "-d"], timeout=120)  # 変わったサービスを作り直す(db or app)
+    time.sleep(6)
+    start_attack(scenario)
+
+
+def reset_baseline():
+    """docker-compose を"壊れた初期状態"(max-connections=50 / CACHE無し)へ戻して再構築。
+    これでミッションを何度でも同じ条件からやり直せる。"""
+    path = os.path.join(ROOT, CHAPTER, "docker-compose.yml")
+    try:
+        with open(path, encoding="utf-8") as f:
+            txt = f.read()
+        new = re.sub(r"--max-connections=\d+", "--max-connections=50", txt)
+        new = re.sub(r"[ \t]*CACHE:\s*[\"']?1[\"']?[ \t]*\r?\n", "", new)  # CACHE行を削除
+        if new != txt:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(new)
+    except Exception:
+        pass
+    run(["compose", "-f", path, "up", "-d"], timeout=120)
+
+
+def start_mission(scenario):
+    """毎回 初期状態に戻してから攻撃する（＝毎回ちゃんと壊れる）。"""
+    with _attack_lock:
+        run(["rm", "-f", "dojo-attack"])
+    reset_baseline()
     time.sleep(6)
     start_attack(scenario)
 
@@ -766,6 +792,10 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/api/apply":
             sc = q.get("scenario", ["dbflood"])[0]
             threading.Thread(target=apply_and_retry, args=(sc,), daemon=True).start()
+            self._json({"ok": True})
+        elif u.path == "/api/startmission":
+            sc = q.get("scenario", ["dbflood"])[0]
+            threading.Thread(target=start_mission, args=(sc,), daemon=True).start()
             self._json({"ok": True})
         else:
             self.send_response(404)
